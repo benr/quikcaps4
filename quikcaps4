@@ -1,0 +1,204 @@
+#!/usr/perl5/bin/perl -w
+
+## benr@joyent - 2/11/09
+#
+# V2: 
+#       -> Display data for a specific zone, rather than all.
+#       -> Output RSS RCAP Data (rcapstat)
+#       -> Include Disk (fsstat) Data   (Needs mount_to_fsid)
+#                       --> `kstat -p | grep -i unix:0:vopstats_5280002`
+
+use strict;
+use Sun::Solaris::Kstat;
+
+my $Kstat = Sun::Solaris::Kstat->new();
+
+
+my @zoneList = `/usr/sbin/zoneadm list -p`;
+my @rcapStat = `/bin/rcapstat -z 1 1`;
+my @zfsList  = `/sbin/zfs list -Ht filesystem`;
+
+
+
+## Header:
+print("+-----------+--------------------------------+------------------------+--------------------------------+-----------------+--------+---------------+\n");
+print("| Zone Name |          Disk (ZFS)            |      C P U             |   Resident Memory  (Rcap)      |  Virtual Memory | Uptime |  I/O Activity |\n");
+print("|           |    Free  >   Used   /    Quota | Used / Cap  Max  Over% |  Used  /  Cap  >  Over     VM  |  Used  /   Cap  |  Days  |  Read   Write |\n");
+print("|-----------+--------------------------------+------------------------+--------------------------------+-----------------|--------+---------------|\n");
+      #|    net001 |     158G >    1.09G /     none |   0 / 100 > 102   0.00 |   206M /  256M >  231M    184M |   184M /   512M |      5 |  1.14G  1.24G |
+
+foreach(@zoneList){
+        
+        my ($zoneId, $zoneName, $zoneState, $zoneMount) = split(/:/, $_);
+        #print("Got zone: $zoneName ($zoneId)\n");
+
+        next if($zoneId == 0);
+
+        ###
+        ### RCTL KStats:
+        ###
+
+        my $locker = "lockedmem_zone_${zoneId}";
+        my $lockedUsage = ${Kstat}->{caps}->{$zoneId}->{$locker}->{usage};
+        my $lockedLimit = ${Kstat}->{caps}->{$zoneId}->{$locker}->{value};
+        $lockedLimit = 0 if ($lockedLimit == 18446744073709551615);
+
+        my $swapper = "swapresv_zone_${zoneId}";
+        my $swapUsage = ${Kstat}->{caps}->{$zoneId}->{$swapper}->{usage};
+        my $swapLimit = ${Kstat}->{caps}->{$zoneId}->{$swapper}->{value};
+        
+        my $chipper = "cpucaps_zone_${zoneId}";
+        my $cpuUsage = ${Kstat}->{caps}->{$zoneId}->{$chipper}->{usage};
+        my $cpuMax   = ${Kstat}->{caps}->{$zoneId}->{$chipper}->{maxusage};
+        my $cpuValue = ${Kstat}->{caps}->{$zoneId}->{$chipper}->{value};
+        my $cpuAbove = ${Kstat}->{caps}->{$zoneId}->{$chipper}->{above_sec};
+        my $cpuBelow = ${Kstat}->{caps}->{$zoneId}->{$chipper}->{below_sec};
+
+        ###
+        ### RCAP:
+        ###
+        my $rcapVM = 0;
+        my $rcapRSS = 0;
+        my $rcapCAP = 0;
+        my $rcapOVER = "-";
+
+        foreach(@rcapStat) {
+                my ($rid, $rzone, $rnproc, $rvm, $rrss, $rcap, $rat, $ravgat, $rpg, $ravgpg) = split;
+
+                next if ( $rid eq "id" );
+
+                if ($rzone eq $zoneName) {
+                        #print("-- RCAP: $rzone, $rvm, $rrss, $rcap\n");
+                        $rcapVM   = $rvm;
+                        $rcapRSS  = $rrss;
+                        $rcapCAP  = $rcap;
+                        $rcapOVER = $rpg;
+                } 
+        }
+
+        ###
+        ### ZFS:
+        ###
+        my $zfsUsed = 0;
+        my $zfsFree = 0;
+        my $zfsQuota = 0;
+	my $mountPoint = "";
+        
+        foreach(@zfsList) {
+                my ($zDataset, $zUsed, $zAvail, $zRefer, $zMount) = split;
+
+                if ($zMount eq $zoneMount) {
+                        $zfsQuota = `/sbin/zfs get -H -o value quota $zDataset`;
+                        chomp($zfsQuota);
+                        $zfsUsed  = $zUsed;
+                        $zfsFree  = $zAvail;
+			$mountPoint = $zMount;
+
+                        #print(" -- ZFS: $zDataset    $zUsed / $zAvail  - Quota: $zfsQuota\n");
+                }
+        }       
+        ###
+
+	###
+	### Estimated Zone Uptime & CPU Excess Percentage
+	###
+
+	my $uptimeSec   = $cpuAbove + $cpuBelow;
+	my $uptimeDays  = $uptimeSec / 60 / 60 / 24;	
+
+	my $cpuOver     = $cpuAbove / $uptimeSec;		### This is the percentage of time spent above the CPU cap
+	my $cpuOverPerc = sprintf("%.2f", $cpuOver * 100);
+		
+
+	###
+	### VFS Activity
+	###
+	my @fsstats = `/bin/fsstat -f $mountPoint`;
+	
+	my $vfsReadBytes  = 0;
+	my $vfsWriteBytes = 0;
+
+	foreach(@fsstats) {
+		my ($vop, $vopCount, $vopBytes) = split;
+		next if ( !$vop ); 
+
+		if ( $vop eq "read") { $vfsReadBytes  = $vopBytes; }
+		if ( $vop eq "write") { $vfsWriteBytes = $vopBytes; }
+	}
+	###
+
+
+        ######### FORMATING:
+        
+        printf("| %9s | %8s > %8s / %8s | %3d / %3d > %3d %6s |  %5s / %5s > %5s  %6s | %6s / %6s | %6d | %6s %6s |\n", 
+                        $zoneName, 
+                        $zfsFree,
+                        $zfsUsed,
+                        $zfsQuota,
+                        $cpuUsage, 
+                        $cpuValue,
+                        $cpuMax,
+			$cpuOverPerc,
+                        $rcapRSS, 
+                        $rcapCAP, 
+                        $rcapOVER,
+                        $rcapVM,
+                        &btoh($swapUsage),
+                        &btoh($swapLimit),
+			$uptimeDays,
+			$vfsReadBytes,
+			$vfsWriteBytes
+                        );
+
+}
+
+
+
+####### Print Footer:
+      #|    net001 |     158G >    1.09G /     none |   0 / 100 > 102   0.00 |   206M /  256M >  231M    184M |   184M /   512M |      5 |  1.14G  1.24G |
+print("+-----------+--------------------------------+------------------------+--------------------------------+-----------------+--------+---- +Joyent --+\n");
+
+
+
+
+
+
+
+
+######                        #################################################
+######  S U B R O U T I N E S #################################################
+######                        #################################################
+
+sub btoh($)
+{
+        my $byte = shift;
+
+        if ( $byte == 0 ) {
+                return("0");
+        }
+
+        if ( $byte < 1023 )  {
+                return("1K");   
+        }
+
+        if ( $byte < 1048575 ) {
+                my $y = $byte / 1024;
+                my $x = sprintf("%.1dK", $y);
+                return($x);
+        }
+
+        if ( $byte < 1073741823 ) {
+                my $y = $byte / 1048576;
+                my $x = sprintf("%.1dM", $y);
+                return($x);
+        }
+
+        if ( $byte >= 1073741824 ) {
+                my $y = $byte / 1073741824;
+                my $x = sprintf("%.1dG", $y);
+                return($x);
+        }
+
+        die("Ooops.\n");
+}
+
